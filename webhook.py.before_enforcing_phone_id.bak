@@ -1,0 +1,149 @@
+
+import hashlib
+import hmac
+import logging
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
+
+from whatsapp_processor import process_webhook_payload
+
+load_dotenv(override=True)
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+def matches_configured_phone_number(payload: dict) -> bool:
+    """Require incoming message events to target our configured number."""
+    from dotenv import dotenv_values
+
+    configured_id = dotenv_values(
+        Path(__file__).resolve().parent / ".env"
+    ).get("PHONE_NUMBER_ID", "")
+
+    if not configured_id or not isinstance(payload, dict):
+        return False
+
+    if payload.get("object") != "whatsapp_business_account":
+        return False
+
+    entries = payload.get("entry", [])
+    if not isinstance(entries, list) or not entries:
+        return False
+
+    found_message_event = False
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+
+        changes = entry.get("changes", [])
+        if not isinstance(changes, list):
+            return False
+
+        for change in changes:
+            if not isinstance(change, dict):
+                return False
+
+            if change.get("field") != "messages":
+                continue
+
+            value = change.get("value", {})
+            if not isinstance(value, dict):
+                return False
+
+            messages = value.get("messages", [])
+            if not messages:
+                continue
+
+            found_message_event = True
+            metadata = value.get("metadata", {})
+            if not isinstance(metadata, dict):
+                return False
+
+            if str(metadata.get("phone_number_id", "")) != str(configured_id):
+                return False
+
+    return found_message_event
+
+
+def auto_reply_enabled() -> bool:
+    return os.getenv("AUTO_REPLY_ENABLED", "false").strip().lower() == "true"
+
+
+def verify_meta_signature(raw_body: bytes, signature: str | None) -> bool:
+    """Validate Meta's X-Hub-Signature-256 header."""
+    app_secret = os.getenv("META_APP_SECRET", "")
+
+    if not app_secret or not signature:
+        return False
+
+    expected = "sha256=" + hmac.new(
+        app_secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+@app.get("/")
+async def home():
+    return {
+        "status": "Webhook server is running",
+        "auto_reply_enabled": auto_reply_enabled(),
+    }
+
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    verify_token = os.getenv("VERIFY_TOKEN", "")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == verify_token and challenge:
+        return PlainTextResponse(challenge)
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    if not verify_meta_signature(raw_body, signature):
+        logging.warning("Webhook rejected: invalid or missing Meta signature.")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        import json
+        body = json.loads(raw_body)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    try:
+        results = process_webhook_payload(body)
+
+        logging.info(
+            "Webhook processed; replies prepared: %d",
+            len(results),
+        )
+
+        for result in results:
+            logging.info(
+                "Reply prepared; escalation required: %s; auto-reply enabled: %s",
+                result["escalate"],
+                auto_reply_enabled(),
+            )
+
+        # Intentionally never send replies from this webhook.
+
+    except Exception:
+        logging.exception("Webhook processing failed")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
+
+    return {"status": "EVENT_RECEIVED"}

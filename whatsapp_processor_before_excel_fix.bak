@@ -1,0 +1,194 @@
+
+import logging
+import os
+
+from message_handler import extract_incoming_messages
+from ai_helper import generate_reply
+from whatsapp_sender import send_text_message
+from message_state import (
+    claim_message,
+    save_prepared_reply,
+    set_message_status,
+)
+from escalation import check_escalation
+from customer_store import save_customer
+from message_log import log_message
+from staff_notifier import notify_staff
+from human_takeover import (
+    activate_takeover,
+    is_takeover_active,
+    resume_customer,
+)
+
+
+def _mark_intentionally_skipped(message_id: str, reason: str) -> None:
+    """Record that no customer reply was prepared, without sending anything."""
+    if not set_message_status(message_id, "failed", error=reason):
+        logging.error("Could not record the intentionally skipped message.")
+
+
+def _handle_resume_command(message: dict) -> None:
+    """Handle /resume CUSTOMER_PHONE without replying to the staff command."""
+    message_id = message.get("message_id", "")
+    sender = message.get("sender", "")
+    parts = message.get("text", "").strip().split()
+
+    if not claim_message(message_id):
+        logging.info("Duplicate staff command skipped.")
+        return
+
+    resumed = False
+    if len(parts) == 2 and parts[0].lower() == "/resume":
+        resumed = resume_customer(
+            customer_phone=parts[1],
+            staff_phone=sender,
+        )
+
+    # Never treat a staff command as a customer reply.
+    _mark_intentionally_skipped(
+        message_id,
+        "Staff /resume command consumed; no customer reply prepared.",
+    )
+
+    if resumed:
+        logging.info("Authorized resume command accepted.")
+    else:
+        logging.warning("Resume command rejected or invalid.")
+
+
+def process_webhook_payload(payload: dict) -> list[dict]:
+    """Log incoming messages and prepare replies; never send from the webhook."""
+    results = []
+
+    for message in extract_incoming_messages(payload):
+        message_id = message["message_id"]
+        sender = message["sender"]
+        text = message["text"]
+
+        # /resume is a staff command, not a customer support question.
+        first_word = text.strip().split(maxsplit=1)
+        if first_word and first_word[0].lower() == "/resume":
+            _handle_resume_command(message)
+            continue
+
+        if not claim_message(message_id):
+            logging.info("Duplicate or previously claimed message skipped.")
+            continue
+
+        try:
+            log_message(
+                phone=sender,
+                text=text,
+                customer_name=message.get("customer_name", ""),
+                message_type="text",
+                direction="incoming",
+            )
+
+            save_customer(
+                phone=sender,
+                message=text,
+                customer_name=message.get("customer_name", ""),
+            )
+
+            # A live takeover suppresses AI replies until authorized resume.
+            if is_takeover_active(sender):
+                _mark_intentionally_skipped(
+                    message_id,
+                    "Automated reply intentionally suppressed: "
+                    "human takeover is active.",
+                )
+                logging.info(
+                    "Automated reply suppressed for active human takeover."
+                )
+                continue
+
+            escalation = check_escalation(text)
+            staff_alert_sent = False
+
+            if escalation["escalate"]:
+                # Fail closed if persistent takeover cannot be activated.
+                if not activate_takeover(
+                    sender,
+                    reason=escalation["reason"],
+                    updated_by="system",
+                ):
+                    _mark_intentionally_skipped(
+                        message_id,
+                        "Takeover could not be activated; "
+                        "automated reply suppressed.",
+                    )
+                    logging.error("Human takeover activation failed.")
+                    continue
+
+                if (
+                    os.getenv("STAFF_ALERTS_ENABLED", "false")
+                    .strip()
+                    .lower()
+                    == "true"
+                ):
+                    try:
+                        notify_staff(
+                            customer_phone=sender,
+                            reason=escalation["reason"],
+                        )
+                        staff_alert_sent = True
+                        logging.info("Staff alert accepted by WhatsApp API.")
+                    except Exception as exc:
+                        logging.error(
+                            "Staff alert failed: %s",
+                            type(exc).__name__,
+                        )
+                else:
+                    logging.info(
+                        "Human escalation detected; staff alert remains "
+                        "disabled by STAFF_ALERTS_ENABLED."
+                    )
+
+                reply = (
+                    "Thank you for contacting Nahar. Your message needs "
+                    "assistance from an authorized representative. Staff "
+                    "notification is not yet confirmed through this system. "
+                    "Please contact an authorized representative directly."
+                )
+            else:
+                reply = generate_reply(text)
+
+            if not save_prepared_reply(message_id, reply):
+                set_message_status(
+                    message_id,
+                    "failed",
+                    error="Could not save prepared reply to SQLite.",
+                )
+                logging.error("Prepared reply could not be saved.")
+                continue
+
+            results.append({
+                "sender": sender,
+                "incoming_text": text,
+                "message_id": message_id,
+                "reply_text": reply,
+                # Preserve Meta's original Unix timestamp for the send guard.
+                "customer_message_timestamp": message.get("timestamp"),
+                "escalate": escalation["escalate"],
+                "escalation_reason": escalation["reason"],
+                "staff_alert_sent": staff_alert_sent,
+            })
+
+        except Exception as exc:
+            set_message_status(
+                message_id,
+                "failed",
+                error=f"Reply preparation failed: {type(exc).__name__}",
+            )
+            raise
+
+    return results
+
+
+def send_prepared_reply(result: dict) -> dict:
+    """Send only when explicitly called and all sender safety checks pass."""
+    return send_text_message(
+        result["sender"],
+        result["reply_text"],
+        customer_message_timestamp=result.get("customer_message_timestamp"),
+    )

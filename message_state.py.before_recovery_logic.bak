@@ -1,0 +1,86 @@
+
+import sqlite3
+from pathlib import Path
+
+DB_FILE = Path(__file__).resolve().parent / "message_state.sqlite3"
+BUSY_TIMEOUT_SECONDS = 10
+
+
+def _connect():
+    connection = sqlite3.connect(
+        DB_FILE,
+        timeout=BUSY_TIMEOUT_SECONDS,
+    )
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_state (
+            message_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'processing',
+                    'sent',
+                    'failed',
+                    'uncertain'
+                )
+            ),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    return connection
+
+
+def claim_message(message_id: str) -> bool:
+    """Atomically claim a message ID once; never reclaim existing IDs."""
+    if not isinstance(message_id, str) or not message_id.strip():
+        return False
+
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO message_state (message_id, status)
+                VALUES (?, 'processing')
+                """,
+                (message_id,),
+            )
+            return cursor.rowcount == 1
+    except sqlite3.Error:
+        # Fail closed: do not process if state cannot be recorded.
+        return False
+
+
+def set_message_status(message_id: str, status: str) -> bool:
+    """Update a claimed message to a known outcome."""
+    allowed = {"processing", "sent", "failed", "uncertain"}
+
+    if not message_id or status not in allowed:
+        return False
+
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE message_state
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE message_id = ?
+                """,
+                (status, message_id),
+            )
+            return cursor.rowcount == 1
+    except sqlite3.Error:
+        return False
+
+
+def get_message_status(message_id: str) -> str | None:
+    """Return the stored status, or None if the message is unknown."""
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM message_state WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            return row[0] if row else None
+    except sqlite3.Error:
+        return None

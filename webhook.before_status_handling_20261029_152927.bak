@@ -1,0 +1,321 @@
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+from pathlib import Path
+
+from dotenv import dotenv_values, load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
+
+from message_state import set_message_status
+from whatsapp_processor import (
+    process_webhook_payload,
+    send_prepared_reply,
+)
+from whatsapp_sender import (
+    WhatsAppSendError,
+    WhatsAppSendUncertain,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE, override=True)
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+
+
+def auto_reply_enabled() -> bool:
+    """Return whether outgoing automatic replies are explicitly enabled."""
+    return (
+        os.getenv("AUTO_REPLY_ENABLED", "false").strip().lower()
+        == "true"
+    )
+
+
+def matches_configured_phone_number(payload: dict) -> bool:
+    """Accept message events only for the configured WhatsApp phone number."""
+    configured_id = str(
+        dotenv_values(ENV_FILE).get("PHONE_NUMBER_ID", "")
+    ).strip()
+
+    if not configured_id or not isinstance(payload, dict):
+        return False
+
+    if payload.get("object") != "whatsapp_business_account":
+        return False
+
+    entries = payload.get("entry", [])
+    if not isinstance(entries, list) or not entries:
+        return False
+
+    found_message_event = False
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+
+        changes = entry.get("changes", [])
+        if not isinstance(changes, list):
+            return False
+
+        for change in changes:
+            if not isinstance(change, dict):
+                return False
+
+            if change.get("field") != "messages":
+                continue
+
+            value = change.get("value", {})
+            if not isinstance(value, dict):
+                return False
+
+            messages = value.get("messages", [])
+            if not isinstance(messages, list) or not messages:
+                continue
+
+            found_message_event = True
+
+            metadata = value.get("metadata", {})
+            if not isinstance(metadata, dict):
+                return False
+
+            incoming_id = str(
+                metadata.get("phone_number_id", "")
+            ).strip()
+
+            if incoming_id != configured_id:
+                logging.warning(
+                    "Phone ID mismatch: configured ends=%s, incoming ends=%s",
+                    configured_id[-4:],
+                    incoming_id[-4:],
+                )
+                return False
+
+    return found_message_event
+
+
+def verify_meta_signature(
+    raw_body: bytes,
+    signature: str | None,
+) -> bool:
+    """Validate Meta's X-Hub-Signature-256 header."""
+    app_secret = os.getenv("META_APP_SECRET", "")
+
+    if not app_secret or not signature:
+        return False
+
+    expected = "sha256=" + hmac.new(
+        app_secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+def record_send_status(
+    message_id: str,
+    status: str,
+    error: str | None = None,
+) -> bool:
+    """Record a message outcome without exposing message contents in logs."""
+    saved = set_message_status(
+        message_id,
+        status,
+        error=error,
+    )
+
+    if not saved:
+        logging.critical(
+            "Could not record outgoing message status=%s; "
+            "message_id_present=%s",
+            status,
+            bool(message_id),
+        )
+
+    return saved
+
+
+@app.get("/")
+async def home():
+    """Health check that does not expose credentials."""
+    return {
+        "status": "Webhook server is running",
+        "auto_reply_enabled": auto_reply_enabled(),
+    }
+
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    """Handle Meta's webhook subscription verification challenge."""
+    verify_token = os.getenv("VERIFY_TOKEN", "")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if (
+        mode == "subscribe"
+        and verify_token
+        and token == verify_token
+        and challenge
+    ):
+        return PlainTextResponse(challenge)
+
+    # Never log the query string or verification token.
+    raise HTTPException(
+        status_code=403,
+        detail="Verification failed",
+    )
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    """Verify and process a Meta webhook event."""
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    if not verify_meta_signature(raw_body, signature):
+        logging.warning(
+            "Webhook rejected: invalid or missing Meta signature."
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid signature",
+        )
+
+    try:
+        body = json.loads(raw_body)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON",
+        )
+
+    if not matches_configured_phone_number(body):
+        logging.warning(
+            "Webhook rejected: missing or mismatched phone-number ID."
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook destination",
+        )
+
+    try:
+        results = process_webhook_payload(body)
+
+        logging.info(
+            "Webhook processed; replies prepared: %d",
+            len(results),
+        )
+
+        for result in results:
+            logging.info(
+                "Reply prepared; escalation required: %s; "
+                "auto-reply enabled: %s",
+                bool(result.get("escalate")),
+                auto_reply_enabled(),
+            )
+
+        # Default behavior is preparation only. Sending requires an
+        # explicit AUTO_REPLY_ENABLED=true in the process environment.
+        if auto_reply_enabled():
+            for result in results:
+                message_id = result.get("message_id", "")
+
+                # A request for human help must never receive an
+                # automatic AI response.
+                if result.get("escalate"):
+                    record_send_status(
+                        message_id,
+                        "failed",
+                        error=(
+                            "Human escalation required; "
+                            "automatic send suppressed"
+                        ),
+                    )
+                    logging.info(
+                        "Automated send suppressed because "
+                        "human escalation is required."
+                    )
+                    continue
+
+                try:
+                    # The sender enforces its timestamp/window,
+                    # configuration, and retry safety checks.
+                    send_prepared_reply(result)
+
+                except WhatsAppSendUncertain as exc:
+                    record_send_status(
+                        message_id,
+                        "uncertain",
+                        error=type(exc).__name__,
+                    )
+                    logging.error(
+                        "Customer send outcome is uncertain. "
+                        "Manual delivery verification is required; "
+                        "do not automatically resend."
+                    )
+
+                except WhatsAppSendError as exc:
+                    record_send_status(
+                        message_id,
+                        "failed",
+                        error=type(exc).__name__,
+                    )
+                    logging.warning(
+                        "WhatsApp rejected the customer reply."
+                    )
+
+                except (RuntimeError, ValueError) as exc:
+                    record_send_status(
+                        message_id,
+                        "failed",
+                        error=type(exc).__name__,
+                    )
+                    logging.warning(
+                        "Customer reply blocked by sender safety "
+                        "checks or configuration."
+                    )
+
+                except Exception as exc:
+                    # An unexpected error after attempting a send is
+                    # conservatively classified as uncertain.
+                    record_send_status(
+                        message_id,
+                        "uncertain",
+                        error=type(exc).__name__,
+                    )
+                    logging.exception(
+                        "Unexpected send outcome. "
+                        "Do not automatically retry."
+                    )
+
+                else:
+                    if record_send_status(message_id, "sent"):
+                        logging.info(
+                            "Customer reply accepted by WhatsApp API; "
+                            "sent status recorded."
+                        )
+                    else:
+                        logging.critical(
+                            "WhatsApp API accepted a reply, but its "
+                            "sent status could not be recorded. "
+                            "Do not retry it automatically."
+                        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logging.exception("Webhook processing failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed",
+        )
+
+    return {"status": "EVENT_RECEIVED"}

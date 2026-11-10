@@ -1,0 +1,29 @@
+def extract_incoming_messages(payload):
+    """Extract incoming WhatsApp text messages from a Meta webhook event."""
+    messages = []
+
+    if payload.get("object") != "whatsapp_business_account":
+        return messages
+
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") != "messages":
+                continue
+
+            value = change.get("value", {})
+
+            for message in value.get("messages", []):
+                if message.get("type") != "text":
+                    continue
+
+                text_body = message.get("text", {}).get("body", "").strip()
+                sender = message.get("from", "")
+
+                if sender and text_body:
+                    messages.append({
+                        "sender": sender,
+                        "text": text_body,
+                        "message_id": message.get("id", "")
+                    })
+
+    return messages

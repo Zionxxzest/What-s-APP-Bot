@@ -1,0 +1,64 @@
+HUMAN_KEYWORDS = [
+    "human",
+    "real person",
+    "talk to a person",
+    "speak to staff",
+    "talk to staff",
+    "customer service agent",
+    "call me",
+    "manager",
+    "supervisor",
+]
+
+ANGRY_KEYWORDS = [
+    "angry",
+    "furious",
+    "terrible service",
+    "very disappointed",
+    "complaint",
+    "scam",
+    "fraud",
+    "unacceptable",
+    "worst service",
+]
+
+FINANCE_KEYWORDS = [
+    "investment",
+    "investing",
+    "stock",
+    "stocks",
+    "share market",
+    "trading",
+    "crypto",
+    "cryptocurrency",
+    "loan",
+    "financial advice",
+    "profit guarantee",
+]
+
+
+def check_escalation(message: str) -> dict:
+    text = message.casefold()
+
+    if any(keyword in text for keyword in HUMAN_KEYWORDS):
+        return {
+            "escalate": True,
+            "reason": "Customer requested a human",
+        }
+
+    if any(keyword in text for keyword in ANGRY_KEYWORDS):
+        return {
+            "escalate": True,
+            "reason": "Possible complaint or upset customer",
+        }
+
+    if any(keyword in text for keyword in FINANCE_KEYWORDS):
+        return {
+            "escalate": True,
+            "reason": "Finance or investment-related question",
+        }
+
+    return {
+        "escalate": False,
+        "reason": "",
+    }

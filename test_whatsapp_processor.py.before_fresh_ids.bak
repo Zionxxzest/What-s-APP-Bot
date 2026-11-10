@@ -1,0 +1,37 @@
+from whatsapp_processor import process_webhook_payload
+
+sample_payload = {
+    "object": "whatsapp_business_account",
+    "entry": [
+        {
+            "changes": [
+                {
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "from": "8801000000000",
+                                "id": "test-message-processor-20261024-C3",
+                                "type": "text",
+                                "text": {
+                                    "body": "What are your business hours?"
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ],
+}
+
+results = process_webhook_payload(sample_payload)
+
+assert len(results) == 1, "Expected one processed message"
+assert results[0]["sender"] == "8801000000000"
+assert results[0]["incoming_text"] == "What are your business hours?"
+assert results[0]["reply_text"], "Expected a non-empty AI reply"
+
+print("TEST PASSED")
+print("Incoming:", results[0]["incoming_text"])
+print("AI reply:", results[0]["reply_text"])

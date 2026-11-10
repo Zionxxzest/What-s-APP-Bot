@@ -1,0 +1,79 @@
+
+import logging
+
+from message_handler import extract_incoming_messages
+from ai_helper import generate_reply
+from whatsapp_sender import send_text_message
+from message_state import (
+    claim_message,
+    save_prepared_reply,
+    set_message_status,
+)
+from escalation import check_escalation
+from customer_store import save_customer
+
+
+def process_webhook_payload(payload: dict) -> list[dict]:
+    """Claim incoming messages and save replies; never send automatically."""
+    results = []
+
+    for message in extract_incoming_messages(payload):
+        message_id = message["message_id"]
+
+        if not claim_message(message_id):
+            logging.info("Duplicate or previously claimed message skipped.")
+            continue
+
+        try:
+            save_customer(
+                phone=message["sender"],
+                message=message["text"],
+            )
+
+            escalation = check_escalation(message["text"])
+
+            if escalation["escalate"]:
+                reply = (
+                    "Thank you for contacting Nahar. Your message needs "
+                    "assistance from an authorized representative. Staff "
+                    "notification is not yet confirmed through this system. "
+                    "Please contact an authorized representative directly."
+                )
+            else:
+                reply = generate_reply(message["text"])
+
+            if not save_prepared_reply(message_id, reply):
+                set_message_status(
+                    message_id,
+                    "failed",
+                    error="Could not save prepared reply to SQLite.",
+                )
+                logging.error("Prepared reply could not be saved.")
+                continue
+
+            results.append({
+                "sender": message["sender"],
+                "incoming_text": message["text"],
+                "message_id": message_id,
+                "reply_text": reply,
+                "escalate": escalation["escalate"],
+                "escalation_reason": escalation["reason"],
+            })
+
+        except Exception as exc:
+            set_message_status(
+                message_id,
+                "failed",
+                error=f"Reply preparation failed: {type(exc).__name__}",
+            )
+            raise
+
+    return results
+
+
+def send_prepared_reply(result: dict) -> dict:
+    """Explicit sender utility; the webhook does not call this function."""
+    return send_text_message(
+        result["sender"],
+        result["reply_text"],
+    )

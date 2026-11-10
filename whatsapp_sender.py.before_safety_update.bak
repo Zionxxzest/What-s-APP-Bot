@@ -1,0 +1,53 @@
+import os
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+
+GRAPH_API_VERSION = "v23.0"
+
+
+def send_text_message(recipient: str, message: str) -> dict:
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        raise RuntimeError(
+            "WHATSAPP_TOKEN or PHONE_NUMBER_ID is missing from .env"
+        )
+
+    url = (
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
+        f"{PHONE_NUMBER_ID}/messages"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": message,
+        },
+    }
+
+    response = httpx.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=30.0,
+    )
+
+    if response.is_error:
+        raise RuntimeError(
+            f"WhatsApp API returned HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response.json()

@@ -1,0 +1,64 @@
+
+from message_handler import extract_incoming_messages
+from ai_helper import generate_reply
+from whatsapp_sender import send_text_message
+from message_state import claim_message, set_message_status
+from escalation import check_escalation
+from customer_store import save_customer
+
+
+def process_webhook_payload(payload: dict) -> list[dict]:
+    """Claim and prepare messages; never send automatically."""
+    results = []
+
+    for message in extract_incoming_messages(payload):
+        message_id = message["message_id"]
+
+        # Atomically reject duplicates and fail closed if the DB is unavailable.
+        if not claim_message(message_id):
+            continue
+
+        try:
+            save_customer(
+                phone=message["sender"],
+                message=message["text"],
+            )
+
+            escalation = check_escalation(message["text"])
+
+            if escalation["escalate"]:
+                reply = (
+                    "Thank you for contacting Nahar. Your message needs "
+                    "assistance from an authorized representative. Staff "
+                    "notification is not yet confirmed through this system. "
+                    "Please contact an authorized representative directly."
+                )
+            else:
+                reply = generate_reply(message["text"])
+
+            results.append({
+                "sender": message["sender"],
+                "incoming_text": message["text"],
+                "message_id": message_id,
+                "reply_text": reply,
+                "escalate": escalation["escalate"],
+                "escalation_reason": escalation["reason"],
+            })
+
+            # Leave status as 'processing' until a deliberate send workflow
+            # is implemented and can record the outcome safely.
+
+        except Exception:
+            # Do not auto-retry this message: the failure point may be unclear.
+            set_message_status(message_id, "uncertain")
+            raise
+
+    return results
+
+
+def send_prepared_reply(result: dict) -> dict:
+    """Explicit sender utility; the webhook does not call this function."""
+    return send_text_message(
+        result["sender"],
+        result["reply_text"],
+    )

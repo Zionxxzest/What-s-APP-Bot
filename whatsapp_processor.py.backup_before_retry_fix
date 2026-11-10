@@ -1,0 +1,60 @@
+
+from message_handler import extract_incoming_messages
+from ai_helper import generate_reply
+from whatsapp_sender import send_text_message
+from message_dedup import is_message_new, mark_message_completed
+from escalation import check_escalation
+from customer_store import save_customer
+
+
+def process_webhook_payload(payload: dict) -> list[dict]:
+    results = []
+
+    for message in extract_incoming_messages(payload):
+        message_id = message["message_id"]
+
+        if not is_message_new(message_id):
+            continue
+
+        save_customer(
+            phone=message["sender"],
+            message=message["text"],
+        )
+
+        escalation = check_escalation(message["text"])
+
+        if escalation["escalate"]:
+            reply = (
+                "Thank you for contacting Nahar. Your message needs "
+                "assistance from an authorized representative. Staff "
+                "notification is not yet confirmed through this system. "
+                "Please contact an authorized representative directly."
+            )
+        else:
+            reply = generate_reply(message["text"])
+
+        result = {
+            "sender": message["sender"],
+            "incoming_text": message["text"],
+            "message_id": message_id,
+            "reply_text": reply,
+            "escalate": escalation["escalate"],
+            "escalation_reason": escalation["reason"],
+        }
+
+        if not mark_message_completed(message_id):
+            raise RuntimeError(
+                f"Could not mark message {message_id} as completed."
+            )
+
+        results.append(result)
+
+    return results
+
+
+def send_prepared_reply(result: dict) -> dict:
+    """Send a prepared reply through the WhatsApp Cloud API."""
+    return send_text_message(
+        result["sender"],
+        result["reply_text"],
+    )

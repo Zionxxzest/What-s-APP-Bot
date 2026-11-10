@@ -1,0 +1,65 @@
+
+import logging
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
+
+from whatsapp_processor import process_webhook_payload
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+
+
+@app.get("/")
+async def home():
+    return {"status": "Webhook server is running"}
+
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    import os
+
+    verify_token = os.getenv("VERIFY_TOKEN", "")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == verify_token and challenge:
+        return PlainTextResponse(challenge)
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    try:
+        results = process_webhook_payload(body)
+
+        logging.info(
+            "Webhook processed successfully; incoming text messages handled: %d",
+            len(results),
+        )
+
+        # Replies are deliberately not sent automatically yet.
+        for result in results:
+            logging.info(
+                "Reply prepared; escalation required: %s",
+                result["escalate"],
+            )
+
+    except Exception:
+        logging.exception("Webhook processing failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed",
+        )
+
+    return {"status": "EVENT_RECEIVED"}

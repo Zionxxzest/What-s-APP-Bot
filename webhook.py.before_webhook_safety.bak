@@ -1,0 +1,75 @@
+
+import logging
+import os
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
+
+from whatsapp_processor import process_webhook_payload
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+
+
+def auto_reply_enabled() -> bool:
+    """Replies remain off unless explicitly enabled in .env."""
+    return os.getenv("AUTO_REPLY_ENABLED", "false").strip().lower() == "true"
+
+
+@app.get("/")
+async def home():
+    return {
+        "status": "Webhook server is running",
+        "auto_reply_enabled": auto_reply_enabled(),
+    }
+
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    verify_token = os.getenv("VERIFY_TOKEN", "")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == verify_token and challenge:
+        return PlainTextResponse(challenge)
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    try:
+        results = process_webhook_payload(body)
+
+        logging.info(
+            "Webhook processed; incoming text messages handled: %d",
+            len(results),
+        )
+
+        for result in results:
+            logging.info(
+                "Reply prepared; escalation required: %s; auto-reply enabled: %s",
+                result["escalate"],
+                auto_reply_enabled(),
+            )
+
+        # Intentionally do not send messages here.
+        # Enabling the switch alone cannot trigger automatic sends.
+
+    except Exception:
+        logging.exception("Webhook processing failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed",
+        )
+
+    return {"status": "EVENT_RECEIVED"}

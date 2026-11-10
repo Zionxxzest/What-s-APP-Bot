@@ -1,0 +1,41 @@
+import os
+import json
+import logging
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
+
+
+@app.get("/")
+async def home():
+    return {"status": "Webhook server is running"}
+
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        return PlainTextResponse(challenge)
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    logging.info("Received webhook event:\n%s", json.dumps(body, indent=2))
+
+    return {"status": "EVENT_RECEIVED"}

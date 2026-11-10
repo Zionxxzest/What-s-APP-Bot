@@ -1,0 +1,38 @@
+from whatsapp_processor import process_webhook_payload
+
+def make_payload(message_id, message_text):
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "field": "messages",
+                "value": {
+                    "messages": [{
+                        "from": "8801000000000",
+                        "id": message_id,
+                        "type": "text",
+                        "text": {"body": message_text},
+                    }]
+                },
+            }]
+        }],
+    }
+
+
+ordinary = process_webhook_payload(
+   make_payload("escalation-test-20261024-C2", "What are your business hours?")
+)
+human_request = process_webhook_payload(
+        make_payload("escalation-test-20261024-D2", "I want to talk to a human")
+)
+
+assert len(ordinary) == 1
+assert ordinary[0]["escalate"] is False
+
+assert len(human_request) == 1
+assert human_request[0]["escalate"] is True
+assert human_request[0]["escalation_reason"]
+
+print("TEST PASSED")
+print("Ordinary question: no escalation")
+print("Human request: escalated")

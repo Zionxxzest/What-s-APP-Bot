@@ -1,0 +1,122 @@
+
+import sqlite3
+from pathlib import Path
+
+DB_FILE = Path(__file__).resolve().parent / "message_state.sqlite3"
+BUSY_TIMEOUT_SECONDS = 10
+
+ALLOWED_STATUSES = {"processing", "sent", "failed", "uncertain"}
+
+
+def _connect():
+    connection = sqlite3.connect(
+        DB_FILE,
+        timeout=BUSY_TIMEOUT_SECONDS,
+    )
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_state (
+            message_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (
+                status IN ('processing', 'sent', 'failed', 'uncertain')
+            ),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reply_text TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    return connection
+
+
+def claim_message(message_id: str) -> bool:
+    """Atomically claim a message ID once; never reclaim existing IDs."""
+    if not isinstance(message_id, str) or not message_id.strip():
+        return False
+
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO message_state (message_id, status)
+                VALUES (?, 'processing')
+                """,
+                (message_id,),
+            )
+            return cursor.rowcount == 1
+    except sqlite3.Error:
+        return False
+
+
+def save_prepared_reply(message_id: str, reply_text: str) -> bool:
+    """Save a prepared reply only while the message is processing."""
+    if not message_id or not isinstance(reply_text, str) or not reply_text.strip():
+        return False
+
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE message_state
+                SET reply_text = ?, updated_at = CURRENT_TIMESTAMP,
+                    last_error = NULL
+                WHERE message_id = ? AND status = 'processing'
+                """,
+                (reply_text, message_id),
+            )
+            return cursor.rowcount == 1
+    except sqlite3.Error:
+        return False
+
+
+def set_message_status(
+    message_id: str,
+    status: str,
+    error: str | None = None,
+) -> bool:
+    """Apply only conservative transitions; never reopen a terminal state."""
+    if not message_id or status not in ALLOWED_STATUSES:
+        return False
+
+    transitions = {
+        "processing": {"sent", "failed", "uncertain"},
+        "uncertain": set(),
+        "failed": set(),
+        "sent": set(),
+    }
+
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM message_state WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+
+            if not row or status not in transitions[row[0]]:
+                return False
+
+            cursor = connection.execute(
+                """
+                UPDATE message_state
+                SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE message_id = ? AND status = 'processing'
+                """,
+                (status, error, message_id),
+            )
+            return cursor.rowcount == 1
+    except sqlite3.Error:
+        return False
+
+
+def get_message_status(message_id: str) -> str | None:
+    """Return the stored status, or None if the message is unknown."""
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM message_state WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            return row[0] if row else None
+    except sqlite3.Error:
+        return None
